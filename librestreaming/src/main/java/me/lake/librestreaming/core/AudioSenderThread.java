@@ -7,22 +7,19 @@ import java.nio.ByteBuffer;
 import me.lake.librestreaming.rtmp.RESFlvData;
 import me.lake.librestreaming.rtmp.RESFlvDataCollecter;
 import me.lake.librestreaming.rtmp.RESRtmpSender;
-import me.lake.librestreaming.tools.LogTools;
 
 /**
  * Created by lakeinchina on 26/05/16.
  */
 public class AudioSenderThread extends Thread {
-    private static final long WAIT_TIME = 5000;//1ms;
-    private MediaCodec.BufferInfo eInfo;
-    private long startTime = 0;
+    private static final long WAIT_TIME = -1;//1ms;
+    private long startTime;
     private MediaCodec dstAudioEncoder;
     private RESFlvDataCollecter dataCollecter;
 
     AudioSenderThread(String name, MediaCodec encoder, RESFlvDataCollecter flvDataCollecter) {
         super(name);
-        eInfo = new MediaCodec.BufferInfo();
-        startTime = 0;
+        startTime = System.currentTimeMillis();
         dstAudioEncoder = encoder;
         dataCollecter = flvDataCollecter;
     }
@@ -36,74 +33,56 @@ public class AudioSenderThread extends Thread {
 
     @Override
     public void run() {
+        MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         while (!shouldQuit) {
-            int eobIndex = dstAudioEncoder.dequeueOutputBuffer(eInfo, WAIT_TIME);
-            switch (eobIndex) {
-                case MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED:
-                    LogTools.d("AudioSenderThread,MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED");
-                    break;
-                case MediaCodec.INFO_TRY_AGAIN_LATER:
-//                        LogTools.d("AudioSenderThread,MediaCodec.INFO_TRY_AGAIN_LATER");
-                    break;
-                case MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
-                    LogTools.d("AudioSenderThread,MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:" +
-                            dstAudioEncoder.getOutputFormat().toString());
-                    ByteBuffer csd0 = dstAudioEncoder.getOutputFormat().getByteBuffer("csd-0");
-                    sendAudioSpecificConfig(0, csd0);
-                    break;
-                default:
-                    LogTools.d("AudioSenderThread,MediaCode,eobIndex=" + eobIndex);
-                    if (startTime == 0) {
-                        startTime = eInfo.presentationTimeUs / 1000;
-                    }
-                    /**
-                     * we send audio SpecificConfig already in INFO_OUTPUT_FORMAT_CHANGED
-                     * so we ignore MediaCodec.BUFFER_FLAG_CODEC_CONFIG
-                     */
-                    if (eInfo.flags != MediaCodec.BUFFER_FLAG_CODEC_CONFIG && eInfo.size != 0) {
-                        ByteBuffer realData = dstAudioEncoder.getOutputBuffers()[eobIndex];
-                        realData.position(eInfo.offset);
-                        realData.limit(eInfo.offset + eInfo.size);
-                        sendRealData((eInfo.presentationTimeUs / 1000) - startTime, realData);
-                    }
-                    dstAudioEncoder.releaseOutputBuffer(eobIndex, false);
-                    break;
+            int outputBufferIndex = dstAudioEncoder.dequeueOutputBuffer(bufferInfo, WAIT_TIME);
+            if (outputBufferIndex > 0) {
+                ByteBuffer encodedData = dstAudioEncoder.getOutputBuffer(outputBufferIndex);
+                if (encodedData == null) {
+                    continue;
+                }
+                encodedData.position(bufferInfo.offset);
+                encodedData.limit(bufferInfo.offset + bufferInfo.size);
+                byte[] data = new byte[bufferInfo.size];
+                encodedData.get(data, 0, bufferInfo.size);
+//                encodedData.position(bufferInfo.offset);
+
+                long time = System.currentTimeMillis() - startTime;
+                sendRealData(time, data);
+
+                dstAudioEncoder.releaseOutputBuffer(outputBufferIndex, false);
+            } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                ByteBuffer byteBuffer = dstAudioEncoder.getOutputFormat().getByteBuffer("csd-0");
+                if (byteBuffer != null) {
+                    byte[] data = new byte[byteBuffer.remaining()];
+                    byteBuffer.get(data, 0, byteBuffer.remaining());
+                    long time = System.currentTimeMillis() - startTime;
+                    sendAudioSpecificConfig(time, data);
+                }
+            }
+            if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                //end of stream
+                break;
             }
         }
-        eInfo = null;
     }
 
-    private void sendAudioSpecificConfig(long tms, ByteBuffer realData) {
-        int packetLen = Packager.FLVPackager.FLV_AUDIO_TAG_LENGTH +
-                realData.remaining();
-        byte[] finalBuff = new byte[packetLen];
-        realData.get(finalBuff, Packager.FLVPackager.FLV_AUDIO_TAG_LENGTH,
-                realData.remaining());
-        Packager.FLVPackager.fillFlvAudioTag(finalBuff,
-                0,
-                true);
+    private void sendAudioSpecificConfig(long tms, byte[] data) {
+        //不发送此信息可能导致拉流播放失败
         RESFlvData resFlvData = new RESFlvData();
         resFlvData.droppable = false;
-        resFlvData.byteBuffer = finalBuff;
-        resFlvData.size = finalBuff.length;
+        resFlvData.byteBuffer = data;
+        resFlvData.size = data.length;
         resFlvData.dts = (int) tms;
         resFlvData.flvTagType = RESFlvData.FLV_RTMP_PACKET_TYPE_AUDIO;
         dataCollecter.collect(resFlvData, RESRtmpSender.FROM_AUDIO);
     }
 
-    private void sendRealData(long tms, ByteBuffer realData) {
-        int packetLen = Packager.FLVPackager.FLV_AUDIO_TAG_LENGTH +
-                realData.remaining();
-        byte[] finalBuff = new byte[packetLen];
-        realData.get(finalBuff, Packager.FLVPackager.FLV_AUDIO_TAG_LENGTH,
-                realData.remaining());
-        Packager.FLVPackager.fillFlvAudioTag(finalBuff,
-                0,
-                false);
+    private void sendRealData(long tms, byte[] data) {
         RESFlvData resFlvData = new RESFlvData();
         resFlvData.droppable = true;
-        resFlvData.byteBuffer = finalBuff;
-        resFlvData.size = finalBuff.length;
+        resFlvData.byteBuffer = data;
+        resFlvData.size = data.length;
         resFlvData.dts = (int) tms;
         resFlvData.flvTagType = RESFlvData.FLV_RTMP_PACKET_TYPE_AUDIO;
         dataCollecter.collect(resFlvData, RESRtmpSender.FROM_AUDIO);

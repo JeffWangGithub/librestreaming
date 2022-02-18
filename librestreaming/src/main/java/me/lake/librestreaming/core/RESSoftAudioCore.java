@@ -1,6 +1,5 @@
 package me.lake.librestreaming.core;
 
-import android.media.AudioFormat;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -8,7 +7,6 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
-import android.os.SystemClock;
 
 import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
@@ -16,7 +14,6 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 import me.lake.librestreaming.filter.softaudiofilter.BaseSoftAudioFilter;
-import me.lake.librestreaming.model.RESAudioBuff;
 import me.lake.librestreaming.model.RESConfig;
 import me.lake.librestreaming.model.RESCoreParameters;
 import me.lake.librestreaming.rtmp.RESFlvDataCollecter;
@@ -31,16 +28,9 @@ public class RESSoftAudioCore {
     private MediaCodec dstAudioEncoder;
     private MediaFormat dstAudioFormat;
     //filter
-    private Lock lockAudioFilter = null;
+    private Lock lockAudioFilter;
     private BaseSoftAudioFilter audioFilter;
-    //AudioBuffs
-    //buffers to handle buff from queueAudio
-    private RESAudioBuff[] orignAudioBuffs;
-    private int lastAudioQueueBuffIndex;
-    //buffer to handle buff from orignAudioBuffs
-    private RESAudioBuff orignAudioBuff;
-    private RESAudioBuff filteredAudioBuff;
-    private AudioFilterHandler audioFilterHandler;
+    private AudioEncodeFilterHandler audioEncodeFilterHandler;
     private HandlerThread audioFilterHandlerThread;
     private AudioSenderThread audioSenderThread;
 
@@ -49,17 +39,9 @@ public class RESSoftAudioCore {
         lockAudioFilter = new ReentrantLock(false);
     }
 
-    public void queueAudio(byte[] rawAudioFrame) {
-        int targetIndex = (lastAudioQueueBuffIndex + 1) % orignAudioBuffs.length;
-        if (orignAudioBuffs[targetIndex].isReadyToFill) {
-            LogTools.d("queueAudio,accept ,targetIndex" + targetIndex);
-            System.arraycopy(rawAudioFrame, 0, orignAudioBuffs[targetIndex].buff, 0, resCoreParameters.audioRecoderBufferSize);
-            orignAudioBuffs[targetIndex].isReadyToFill = false;
-            lastAudioQueueBuffIndex = targetIndex;
-            audioFilterHandler.sendMessage(audioFilterHandler.obtainMessage(AudioFilterHandler.WHAT_INCOMING_BUFF, targetIndex, 0));
-        } else {
-            LogTools.d("queueAudio,abandon,targetIndex" + targetIndex);
-        }
+    public void queueAudio(byte[] rawAudioFrame, int size) {
+        //TODO此处需要添加buffer的逻辑
+        audioEncodeFilterHandler.sendMessage(audioEncodeFilterHandler.obtainMessage(AudioEncodeFilterHandler.WHAT_INCOMING_BUFF, size, 0, rawAudioFrame));
     }
 
     public boolean prepare(RESConfig resConfig) {
@@ -76,16 +58,6 @@ public class RESSoftAudioCore {
                 LogTools.e("create Audio MediaCodec failed");
                 return false;
             }
-            //audio
-            //44100/10=4410,4410*2 = 8820
-            int audioQueueNum = resCoreParameters.audioBufferQueueNum;
-            int orignAudioBuffSize = resCoreParameters.mediacodecAACSampleRate / 5;
-            orignAudioBuffs = new RESAudioBuff[audioQueueNum];
-            for (int i = 0; i < audioQueueNum; i++) {
-                orignAudioBuffs[i] = new RESAudioBuff(AudioFormat.ENCODING_PCM_16BIT, orignAudioBuffSize);
-            }
-            orignAudioBuff = new RESAudioBuff(AudioFormat.ENCODING_PCM_16BIT, orignAudioBuffSize);
-            filteredAudioBuff = new RESAudioBuff(AudioFormat.ENCODING_PCM_16BIT, orignAudioBuffSize);
             return true;
         }
     }
@@ -93,20 +65,16 @@ public class RESSoftAudioCore {
     public void start(RESFlvDataCollecter flvDataCollecter) {
         synchronized (syncOp) {
             try {
-                for (RESAudioBuff buff : orignAudioBuffs) {
-                    buff.isReadyToFill = true;
-                }
                 if (dstAudioEncoder == null) {
                     dstAudioEncoder = MediaCodec.createEncoderByType(dstAudioFormat.getString(MediaFormat.KEY_MIME));
                 }
                 dstAudioEncoder.configure(dstAudioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 dstAudioEncoder.start();
-                lastAudioQueueBuffIndex = 0;
                 audioFilterHandlerThread = new HandlerThread("audioFilterHandlerThread");
-                audioSenderThread = new AudioSenderThread("AudioSenderThread", dstAudioEncoder, flvDataCollecter);
                 audioFilterHandlerThread.start();
+                audioEncodeFilterHandler = new AudioEncodeFilterHandler(audioFilterHandlerThread.getLooper());
+                audioSenderThread = new AudioSenderThread("AudioSenderThread", dstAudioEncoder, flvDataCollecter);
                 audioSenderThread.start();
-                audioFilterHandler = new AudioFilterHandler(audioFilterHandlerThread.getLooper());
             } catch (Exception e) {
                 LogTools.trace("RESSoftAudioCore", e);
             }
@@ -115,7 +83,7 @@ public class RESSoftAudioCore {
 
     public void stop() {
         synchronized (syncOp) {
-            audioFilterHandler.removeCallbacksAndMessages(null);
+            audioEncodeFilterHandler.removeCallbacksAndMessages(null);
             audioFilterHandlerThread.quit();
             try {
                 audioFilterHandlerThread.join();
@@ -161,12 +129,12 @@ public class RESSoftAudioCore {
         }
     }
 
-    private class AudioFilterHandler extends Handler {
+    private class AudioEncodeFilterHandler extends Handler {
         public static final int FILTER_LOCK_TOLERATION = 3;//3ms
         public static final int WHAT_INCOMING_BUFF = 1;
         private int sequenceNum;
 
-        AudioFilterHandler(Looper looper) {
+        AudioEncodeFilterHandler(Looper looper) {
             super(looper);
             sequenceNum = 0;
         }
@@ -177,28 +145,30 @@ public class RESSoftAudioCore {
                 return;
             }
             sequenceNum++;
-            int targetIndex = msg.arg1;
-            long nowTimeMs = SystemClock.uptimeMillis();
-            System.arraycopy(orignAudioBuffs[targetIndex].buff, 0,
-                    orignAudioBuff.buff, 0, orignAudioBuff.buff.length);
-            orignAudioBuffs[targetIndex].isReadyToFill = true;
+            long nowTimeMs = System.currentTimeMillis();
+            byte[] orginBufferData = (byte[]) msg.obj;
+            int length = msg.arg1;
             boolean isFilterLocked = lockAudioFilter();
-            boolean filtered = false;
+            boolean filtered;
             if (isFilterLocked) {
-                filtered = audioFilter.onFrame(orignAudioBuff.buff, filteredAudioBuff.buff, nowTimeMs, sequenceNum);
+                byte[] filteredData = new byte[orginBufferData.length];
+                filtered = audioFilter.onFrame(orginBufferData, filteredData, nowTimeMs, sequenceNum);
                 unlockAudioFilter();
-            } else {
-                System.arraycopy(orignAudioBuffs[targetIndex].buff, 0,
-                        orignAudioBuff.buff, 0, orignAudioBuff.buff.length);
-                orignAudioBuffs[targetIndex].isReadyToFill = true;
+                if (filtered) {
+                    orginBufferData = filteredData;
+                }
             }
             //orignAudioBuff is ready
             int eibIndex = dstAudioEncoder.dequeueInputBuffer(-1);
             if (eibIndex >= 0) {
-                ByteBuffer dstAudioEncoderIBuffer = dstAudioEncoder.getInputBuffers()[eibIndex];
-                dstAudioEncoderIBuffer.position(0);
-                dstAudioEncoderIBuffer.put(filtered?filteredAudioBuff.buff:orignAudioBuff.buff, 0, orignAudioBuff.buff.length);
-                dstAudioEncoder.queueInputBuffer(eibIndex, 0, orignAudioBuff.buff.length, nowTimeMs * 1000, 0);
+                ByteBuffer inputBuffer = dstAudioEncoder.getInputBuffer(eibIndex);
+                if (inputBuffer != null) {
+                    inputBuffer.clear();
+                    int bufferRemaining = inputBuffer.remaining();
+                    //剩余buffer大小
+                    inputBuffer.put(orginBufferData, 0, Math.min(bufferRemaining, length));
+                    dstAudioEncoder.queueInputBuffer(eibIndex, 0, inputBuffer.position(), nowTimeMs * 1000, 0);
+                }
             } else {
                 LogTools.d("dstAudioEncoder.dequeueInputBuffer(-1)<0");
             }
@@ -223,6 +193,7 @@ public class RESSoftAudioCore {
                     return false;
                 }
             } catch (InterruptedException e) {
+                e.printStackTrace();
             }
             return false;
         }

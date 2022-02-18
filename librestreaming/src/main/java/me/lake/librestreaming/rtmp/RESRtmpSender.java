@@ -5,6 +5,8 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 
+import net.butterflytv.rtmp_client.RTMPMuxer;
+
 import me.lake.librestreaming.client.CallbackDelivery;
 import me.lake.librestreaming.core.RESByteSpeedometer;
 import me.lake.librestreaming.core.RESFrameRateMeter;
@@ -28,7 +30,8 @@ public class RESRtmpSender {
             workHandlerThread = new HandlerThread("RESRtmpSender,workHandlerThread");
             workHandlerThread.start();
             workHandler = new WorkHandler(coreParameters.senderQueueLength,
-                    new FLvMetaData(coreParameters),
+                    coreParameters.videoWidth,
+                    coreParameters.videoHeight,
                     workHandlerThread.getLooper());
         }
     }
@@ -103,18 +106,18 @@ public class RESRtmpSender {
         private final static int MSG_START = 1;
         private final static int MSG_WRITE = 2;
         private final static int MSG_STOP = 3;
-        private long jniRtmpPointer = 0;
-        private String serverIpAddr = null;
         private int maxQueueLength;
         private int writeMsgNum = 0;
         private final Object syncWriteMsgNum = new Object();
         private RESByteSpeedometer videoByteSpeedometer = new RESByteSpeedometer(TIMEGRANULARITY);
         private RESByteSpeedometer audioByteSpeedometer = new RESByteSpeedometer(TIMEGRANULARITY);
         private RESFrameRateMeter sendFrameRateMeter = new RESFrameRateMeter();
-        private FLvMetaData fLvMetaData;
+//        private FLvMetaData fLvMetaData;
         private RESConnectionListener connectionListener;
         private final Object syncConnectionListener = new Object();
         private int errorTime = 0;
+        private RTMPMuxer rtmpMuxer = new RTMPMuxer();
+        private int videoWidth, videoHeight;
 
         private enum STATE {
             IDLE,
@@ -124,15 +127,16 @@ public class RESRtmpSender {
 
         private STATE state;
 
-        WorkHandler(int maxQueueLength, FLvMetaData fLvMetaData, Looper looper) {
+        WorkHandler(int maxQueueLength, int videoWidth, int videoHeight, Looper looper) {
             super(looper);
             this.maxQueueLength = maxQueueLength;
-            this.fLvMetaData = fLvMetaData;
+            this.videoWidth = videoWidth;
+            this.videoHeight = videoHeight;
             state = STATE.IDLE;
         }
 
         public String getServerIpAddr() {
-            return serverIpAddr;
+            return "";
         }
 
         public float getSendFrameRate() {
@@ -155,11 +159,10 @@ public class RESRtmpSender {
                     }
                     sendFrameRateMeter.reSet();
                     LogTools.d("RESRtmpSender,WorkHandler,tid=" + Thread.currentThread().getId());
-                    jniRtmpPointer = RtmpClient.open((String) msg.obj, true);
-                    final int openR = jniRtmpPointer == 0 ? 1 : 0;
-                    if (openR == 0) {
-                        serverIpAddr = RtmpClient.getIpAddr(jniRtmpPointer);
-                    }
+                    //open =0 是成功
+                    int open = rtmpMuxer.open((String) msg.obj, videoWidth, videoHeight);
+
+                    final int openR = rtmpMuxer.isConnected() ? 0 : 1;
                     synchronized (syncConnectionListener) {
                         if (connectionListener != null) {
                             CallbackDelivery.i().post(new Runnable() {
@@ -170,24 +173,15 @@ public class RESRtmpSender {
                             });
                         }
                     }
-                    if (jniRtmpPointer == 0) {
-                        break;
-                    } else {
-                        byte[] MetaData = fLvMetaData.getMetaData();
-                        RtmpClient.write(jniRtmpPointer,
-                                MetaData,
-                                MetaData.length,
-                                RESFlvData.FLV_RTMP_PACKET_TYPE_INFO, 0);
-                        state = STATE.RUNNING;
-                    }
+                    state = STATE.RUNNING;
                     break;
                 case MSG_STOP:
-                    if (state == STATE.STOPPED || jniRtmpPointer == 0) {
+                    if (state == STATE.STOPPED) {
                         break;
                     }
                     errorTime = 0;
-                    final int closeR = RtmpClient.close(jniRtmpPointer);
-                    serverIpAddr = null;
+                    int close = rtmpMuxer.close();
+                    final int closeR = close;
                     synchronized (syncConnectionListener) {
                         if (connectionListener != null) {
                             CallbackDelivery.i().post(new Runnable() {
@@ -208,12 +202,17 @@ public class RESRtmpSender {
                         break;
                     }
                     RESFlvData flvData = (RESFlvData) msg.obj;
-                    if (writeMsgNum >= (maxQueueLength * 2 / 3) && flvData.flvTagType == RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO && flvData.droppable) {
+                    if (writeMsgNum >= (maxQueueLength * 2 / 3) /*&& flvData.flvTagType == RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO*/ && flvData.droppable) {
                         LogTools.d("senderQueue is crowded,abandon video");
                         break;
                     }
-                    final int res = RtmpClient.write(jniRtmpPointer, flvData.byteBuffer, flvData.byteBuffer.length, flvData.flvTagType, flvData.dts);
-                    if (res == 0) {
+                    int res = -1;
+                    if (flvData.flvTagType == RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO) {
+                        res = rtmpMuxer.writeVideo(flvData.byteBuffer, 0, flvData.size, flvData.dts);
+                    } else if (flvData.flvTagType == RESFlvData.FLV_RTMP_PACKET_TYPE_AUDIO) {
+                        res = rtmpMuxer.writeAudio(flvData.byteBuffer, 0, flvData.size, flvData.dts);
+                    }
+                    if (res > 0) {
                         errorTime = 0;
                         if (flvData.flvTagType == RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO) {
                             videoByteSpeedometer.gain(flvData.size);

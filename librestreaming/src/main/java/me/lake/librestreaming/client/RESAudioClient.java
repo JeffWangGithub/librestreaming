@@ -125,7 +125,7 @@ public class RESAudioClient {
             while (isRunning) {
                 int size = audioRecord.read(audioBuffer, 0, audioBuffer.length);
                 if (isRunning && softAudioCore != null && size > 0) {
-                    softAudioCore.queueAudio(audioBuffer);
+                    softAudioCore.queueAudio(audioBuffer, size);
                 }
             }
         }

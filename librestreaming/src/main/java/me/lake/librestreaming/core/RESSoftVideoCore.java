@@ -27,7 +27,6 @@ import me.lake.librestreaming.filter.softvideofilter.BaseSoftVideoFilter;
 import me.lake.librestreaming.model.RESConfig;
 import me.lake.librestreaming.model.RESCoreParameters;
 import me.lake.librestreaming.model.RESVideoBuff;
-import me.lake.librestreaming.model.Size;
 import me.lake.librestreaming.render.GLESRender;
 import me.lake.librestreaming.render.IRender;
 import me.lake.librestreaming.render.NativeRender;
@@ -54,7 +53,7 @@ public class RESSoftVideoCore implements RESVideoCore {
     //filter
     private Lock lockVideoFilter = null;
     private BaseSoftVideoFilter videoFilter;
-    private VideoFilterHandler videoFilterHandler;
+    private VideoEncoderFilterHandler videoEncoderFilterHandler;
     private HandlerThread videoFilterHandlerThread;
     //sender
     private VideoSenderThread videoSenderThread;
@@ -86,8 +85,8 @@ public class RESSoftVideoCore implements RESVideoCore {
     public void setCurrentCamera(int camIndex) {
         if (currentCamera != camIndex) {
             synchronized (syncOp) {
-                if (videoFilterHandler != null) {
-                    videoFilterHandler.removeMessages(VideoFilterHandler.WHAT_INCOMING_BUFF);
+                if (videoEncoderFilterHandler != null) {
+                    videoEncoderFilterHandler.removeMessages(VideoEncoderFilterHandler.WHAT_INCOMING_BUFF);
                 }
                 if (orignVideoBuffs != null) {
                     for (RESVideoBuff buff : orignVideoBuffs) {
@@ -137,7 +136,7 @@ public class RESSoftVideoCore implements RESVideoCore {
                     BuffSizeCalculator.calculator(videoWidth, videoHeight, resCoreParameters.mediacodecAVCColorFormat));
             videoFilterHandlerThread = new HandlerThread("videoFilterHandlerThread");
             videoFilterHandlerThread.start();
-            videoFilterHandler = new VideoFilterHandler(videoFilterHandlerThread.getLooper());
+            videoEncoderFilterHandler = new VideoEncoderFilterHandler(videoFilterHandlerThread.getLooper());
             return true;
         }
     }
@@ -158,8 +157,8 @@ public class RESSoftVideoCore implements RESVideoCore {
                 videoSenderThread.start();
                 synchronized (syncIsLooping) {
                     if (!isPreviewing && !isStreaming) {
-                        videoFilterHandler.removeMessages(VideoFilterHandler.WHAT_DRAW);
-                        videoFilterHandler.sendMessageDelayed(videoFilterHandler.obtainMessage(VideoFilterHandler.WHAT_DRAW, SystemClock.uptimeMillis() + loopingInterval), loopingInterval);
+                        videoEncoderFilterHandler.removeMessages(VideoEncoderFilterHandler.WHAT_DRAW);
+                        videoEncoderFilterHandler.sendMessageDelayed(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_DRAW, SystemClock.uptimeMillis() + loopingInterval), loopingInterval);
                     }
                     isStreaming = true;
                 }
@@ -215,8 +214,8 @@ public class RESSoftVideoCore implements RESVideoCore {
     @Override
     public void reSetVideoBitrate(int bitrate) {
         synchronized (syncOp) {
-            if (videoFilterHandler != null) {
-                videoFilterHandler.sendMessage(videoFilterHandler.obtainMessage(VideoFilterHandler.WHAT_RESET_BITRATE, bitrate, 0));
+            if (videoEncoderFilterHandler != null) {
+                videoEncoderFilterHandler.sendMessage(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_RESET_BITRATE, bitrate, 0));
                 resCoreParameters.mediacdoecAVCBitRate = bitrate;
                 dstVideoFormat.setInteger(MediaFormat.KEY_BIT_RATE, resCoreParameters.mediacdoecAVCBitRate);
             }
@@ -268,8 +267,8 @@ public class RESSoftVideoCore implements RESVideoCore {
                     visualHeight);
             synchronized (syncIsLooping) {
                 if (!isPreviewing && !isStreaming) {
-                    videoFilterHandler.removeMessages(VideoFilterHandler.WHAT_DRAW);
-                    videoFilterHandler.sendMessageDelayed(videoFilterHandler.obtainMessage(VideoFilterHandler.WHAT_DRAW, SystemClock.uptimeMillis() + loopingInterval), loopingInterval);
+                    videoEncoderFilterHandler.removeMessages(VideoEncoderFilterHandler.WHAT_DRAW);
+                    videoEncoderFilterHandler.sendMessageDelayed(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_DRAW, SystemClock.uptimeMillis() + loopingInterval), loopingInterval);
                 }
                 isPreviewing = true;
             }
@@ -308,7 +307,7 @@ public class RESSoftVideoCore implements RESVideoCore {
                 acceptVideo(rawVideoFrame, orignVideoBuffs[targetIndex].buff);
                 orignVideoBuffs[targetIndex].isReadyToFill = false;
                 lastVideoQueueBuffIndex = targetIndex;
-                videoFilterHandler.sendMessage(videoFilterHandler.obtainMessage(VideoFilterHandler.WHAT_INCOMING_BUFF, targetIndex, 0));
+                videoEncoderFilterHandler.sendMessage(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_INCOMING_BUFF, targetIndex, 0));
             } else {
                 LogTools.d("queueVideo,abandon,targetIndex" + targetIndex);
             }
@@ -360,12 +359,12 @@ public class RESSoftVideoCore implements RESVideoCore {
     @Override
     public float getDrawFrameRate() {
         synchronized (syncOp) {
-            return videoFilterHandler == null ? 0 : videoFilterHandler.getDrawFrameRate();
+            return videoEncoderFilterHandler == null ? 0 : videoEncoderFilterHandler.getDrawFrameRate();
         }
     }
 
     //worker handler
-    private class VideoFilterHandler extends Handler {
+    private class VideoEncoderFilterHandler extends Handler {
         public static final int FILTER_LOCK_TOLERATION = 3;//3ms
         public static final int WHAT_INCOMING_BUFF = 1;
         public static final int WHAT_DRAW = 2;
@@ -373,7 +372,7 @@ public class RESSoftVideoCore implements RESVideoCore {
         private int sequenceNum;
         private RESFrameRateMeter drawFrameRateMeter;
 
-        VideoFilterHandler(Looper looper) {
+        VideoEncoderFilterHandler(Looper looper) {
             super(looper);
             sequenceNum = 0;
             drawFrameRateMeter = new RESFrameRateMeter();
@@ -403,13 +402,13 @@ public class RESSoftVideoCore implements RESVideoCore {
                     synchronized (syncIsLooping) {
                         if (isPreviewing || isStreaming) {
                             if (interval > 0) {
-                                videoFilterHandler.sendMessageDelayed(videoFilterHandler.obtainMessage(
-                                                VideoFilterHandler.WHAT_DRAW,
+                                videoEncoderFilterHandler.sendMessageDelayed(videoEncoderFilterHandler.obtainMessage(
+                                                VideoEncoderFilterHandler.WHAT_DRAW,
                                                 SystemClock.uptimeMillis() + interval),
                                         interval);
                             } else {
-                                videoFilterHandler.sendMessage(videoFilterHandler.obtainMessage(
-                                        VideoFilterHandler.WHAT_DRAW,
+                                videoEncoderFilterHandler.sendMessage(videoEncoderFilterHandler.obtainMessage(
+                                        VideoEncoderFilterHandler.WHAT_DRAW,
                                         SystemClock.uptimeMillis() + loopingInterval));
                             }
                         }

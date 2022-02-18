@@ -24,12 +24,14 @@ public class MainActivity extends AppCompatActivity {
     RadioGroup rg_mode;
     EditText et_url;
     boolean authorized = false;
+    String url = "rtmp://pws0e6958.ws.126.net/live/91e657e2cfbfd6cc50528989dc63835a?wsTime=1637301907&wsSecret=b300b196dc2e4ce3c6153fb492ee46f7";
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         et_url = (EditText) findViewById(R.id.et_url);
+        et_url.setText(url);
         rg_direction = (RadioGroup) findViewById(R.id.rg_direction);
         rg_mode = (RadioGroup) findViewById(R.id.rg_mode);
         rg_direction.check(R.id.rb_port);

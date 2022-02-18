@@ -11,12 +11,12 @@ import me.lake.librestreaming.rtmp.RESRtmpSender;
 import me.lake.librestreaming.tools.LogTools;
 
 /**
- * Created by lakeinchina on 26/05/16.
+ * 主要负责encode源数据，封装成RESFlvData
  */
 public class VideoSenderThread extends Thread {
     private static final long WAIT_TIME = 5000;
     private MediaCodec.BufferInfo eInfo;
-    private long startTime = 0;
+    private long startTime;
     private MediaCodec dstVideoEncoder;
     private final Object syncDstVideoEncoder = new Object();
     private RESFlvDataCollecter dataCollecter;
@@ -51,19 +51,13 @@ public class VideoSenderThread extends Thread {
                     eobIndex = dstVideoEncoder.dequeueOutputBuffer(eInfo, WAIT_TIME);
                 } catch (Exception ignored) {
                 }
-                switch (eobIndex) {
-                    case MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED:
-                        LogTools.d("VideoSenderThread,MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED");
-                        break;
-                    case MediaCodec.INFO_TRY_AGAIN_LATER:
-//                        LogTools.d("VideoSenderThread,MediaCodec.INFO_TRY_AGAIN_LATER");
-                        break;
-                    case MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:
-                        LogTools.d("VideoSenderThread,MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:" +
-                                dstVideoEncoder.getOutputFormat().toString());
+
+                if (eobIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    LogTools.d("VideoSenderThread,MediaCodec.INFO_OUTPUT_FORMAT_CHANGED:" +
+                                dstVideoEncoder.getOutputFormat());
                         sendAVCDecoderConfigurationRecord(0, dstVideoEncoder.getOutputFormat());
-                        break;
-                    default:
+                } else {
+                    if (eobIndex > 0 && dstVideoEncoder.getOutputBuffers() != null) {
                         LogTools.d("VideoSenderThread,MediaCode,eobIndex=" + eobIndex);
                         if (startTime == 0) {
                             startTime = eInfo.presentationTimeUs / 1000;
@@ -74,38 +68,39 @@ public class VideoSenderThread extends Thread {
                          */
                         if (eInfo.flags != MediaCodec.BUFFER_FLAG_CODEC_CONFIG && eInfo.size != 0) {
                             ByteBuffer realData = dstVideoEncoder.getOutputBuffers()[eobIndex];
-                            realData.position(eInfo.offset + 4);
+                            realData.position(eInfo.offset);
                             realData.limit(eInfo.offset + eInfo.size);
+                            realData.position(eInfo.offset);
                             sendRealData((eInfo.presentationTimeUs / 1000) - startTime, realData);
                         }
                         dstVideoEncoder.releaseOutputBuffer(eobIndex, false);
+                    } else if (eobIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                        //超时
+                        continue;
+                    }
+
+                    if ((eInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                         break;
+                    }
                 }
-            }
-            try {
-                sleep(5);
-            } catch (InterruptedException ignored) {
             }
         }
         eInfo = null;
     }
 
     private void sendAVCDecoderConfigurationRecord(long tms, MediaFormat format) {
-        byte[] AVCDecoderConfigurationRecord = Packager.H264Packager.generateAVCDecoderConfigurationRecord(format);
-        int packetLen = Packager.FLVPackager.FLV_VIDEO_TAG_LENGTH +
-                AVCDecoderConfigurationRecord.length;
-        byte[] finalBuff = new byte[packetLen];
-        Packager.FLVPackager.fillFlvVideoTag(finalBuff,
-                0,
-                true,
-                true,
-                AVCDecoderConfigurationRecord.length);
-        System.arraycopy(AVCDecoderConfigurationRecord, 0,
-                finalBuff, Packager.FLVPackager.FLV_VIDEO_TAG_LENGTH, AVCDecoderConfigurationRecord.length);
+        ////不发送此信息可能导致拉流播放失败
+        ByteBuffer sps = format.getByteBuffer("csd-0");
+        ByteBuffer pps = format.getByteBuffer("csd-1");
+        ByteBuffer allocate = ByteBuffer.allocate(sps.limit() + pps.limit());
+        allocate.put(sps.array());
+        allocate.put(pps.array());
+        byte[] config = allocate.array();
+
         RESFlvData resFlvData = new RESFlvData();
         resFlvData.droppable = false;
-        resFlvData.byteBuffer = finalBuff;
-        resFlvData.size = finalBuff.length;
+        resFlvData.byteBuffer = config;
+        resFlvData.size = config.length;
         resFlvData.dts = (int) tms;
         resFlvData.flvTagType = RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO;
         resFlvData.videoFrameType = RESFlvData.NALU_TYPE_IDR;
@@ -114,27 +109,14 @@ public class VideoSenderThread extends Thread {
 
     private void sendRealData(long tms, ByteBuffer realData) {
         int realDataLength = realData.remaining();
-        int packetLen = Packager.FLVPackager.FLV_VIDEO_TAG_LENGTH +
-                Packager.FLVPackager.NALU_HEADER_LENGTH +
-                realDataLength;
-        byte[] finalBuff = new byte[packetLen];
-        realData.get(finalBuff, Packager.FLVPackager.FLV_VIDEO_TAG_LENGTH +
-                        Packager.FLVPackager.NALU_HEADER_LENGTH,
-                realDataLength);
-        int frameType = finalBuff[Packager.FLVPackager.FLV_VIDEO_TAG_LENGTH +
-                Packager.FLVPackager.NALU_HEADER_LENGTH] & 0x1F;
-        Packager.FLVPackager.fillFlvVideoTag(finalBuff,
-                0,
-                false,
-                frameType == 5,
-                realDataLength);
+        byte[] finalBuff = new byte[realDataLength];
+        realData.get(finalBuff, 0, realDataLength);
         RESFlvData resFlvData = new RESFlvData();
         resFlvData.droppable = true;
         resFlvData.byteBuffer = finalBuff;
         resFlvData.size = finalBuff.length;
         resFlvData.dts = (int) tms;
         resFlvData.flvTagType = RESFlvData.FLV_RTMP_PACKET_TYPE_VIDEO;
-        resFlvData.videoFrameType = frameType;
         dataCollecter.collect(resFlvData, RESRtmpSender.FROM_VIDEO);
     }
 }
