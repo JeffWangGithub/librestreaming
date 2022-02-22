@@ -4,18 +4,14 @@ import android.annotation.TargetApi;
 import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
-import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
-import android.media.MediaFormat;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
 
-import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -23,6 +19,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import me.lake.librestreaming.client.CallbackDelivery;
 import me.lake.librestreaming.core.listener.RESScreenShotListener;
 import me.lake.librestreaming.core.listener.RESVideoChangeListener;
+import me.lake.librestreaming.encoder.VideoEncoder;
 import me.lake.librestreaming.filter.softvideofilter.BaseSoftVideoFilter;
 import me.lake.librestreaming.model.RESConfig;
 import me.lake.librestreaming.model.RESCoreParameters;
@@ -43,20 +40,18 @@ public class RESSoftVideoCore implements RESVideoCore {
     private SurfaceTexture cameraTexture;
 
     private int currentCamera;
-    private MediaCodec dstVideoEncoder;
     private boolean isEncoderStarted;
     private final Object syncDstVideoEncoder = new Object();
-    private MediaFormat dstVideoFormat;
     //render
     private final Object syncPreview = new Object();
     private IRender previewRender;
     //filter
-    private Lock lockVideoFilter = null;
+    private Lock lockVideoFilter;
     private BaseSoftVideoFilter videoFilter;
     private VideoEncoderFilterHandler videoEncoderFilterHandler;
     private HandlerThread videoFilterHandlerThread;
     //sender
-    private VideoSenderThread videoSenderThread;
+    private VideoEncoder videoEncoder;
     //VideoBuffs
     //buffers to handle buff from queueVideo
     private RESVideoBuff[] orignVideoBuffs;
@@ -108,14 +103,8 @@ public class RESSoftVideoCore implements RESVideoCore {
             resCoreParameters.mediacodecAVCIFrameInterval = resConfig.getVideoGOP();
             resCoreParameters.mediacodecAVCFrameRate = resCoreParameters.videoFPS;
             loopingInterval = 1000 / resCoreParameters.videoFPS;
-            dstVideoFormat = new MediaFormat();
             synchronized (syncDstVideoEncoder) {
-                dstVideoEncoder = MediaCodecHelper.createSoftVideoMediaCodec(resCoreParameters, dstVideoFormat);
                 isEncoderStarted = false;
-                if (dstVideoEncoder == null) {
-                    LogTools.e("create Video MediaCodec failed");
-                    return false;
-                }
             }
             resCoreParameters.previewBufferSize = BuffSizeCalculator.calculator(resCoreParameters.videoWidth,
                     resCoreParameters.videoHeight, resCoreParameters.previewColorFormat);
@@ -146,15 +135,10 @@ public class RESSoftVideoCore implements RESVideoCore {
         synchronized (syncOp) {
             try {
                 synchronized (syncDstVideoEncoder) {
-                    if (dstVideoEncoder == null) {
-                        dstVideoEncoder = MediaCodec.createEncoderByType(dstVideoFormat.getString(MediaFormat.KEY_MIME));
-                    }
-                    dstVideoEncoder.configure(dstVideoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                    dstVideoEncoder.start();
+                    videoEncoder = new VideoEncoder(resCoreParameters, flvDataCollecter);
+                    videoEncoder.start();
                     isEncoderStarted = true;
                 }
-                videoSenderThread = new VideoSenderThread("VideoSenderThread", dstVideoEncoder, flvDataCollecter);
-                videoSenderThread.start();
                 synchronized (syncIsLooping) {
                     if (!isPreviewing && !isStreaming) {
                         videoEncoderFilterHandler.removeMessages(VideoEncoderFilterHandler.WHAT_DRAW);
@@ -177,22 +161,16 @@ public class RESSoftVideoCore implements RESVideoCore {
     @Override
     public boolean stopStreaming() {
         synchronized (syncOp) {
-            videoSenderThread.quit();
+            synchronized (syncDstVideoEncoder) {
+                if (videoEncoder != null) {
+                    videoEncoder.quit();
+                }
+                isEncoderStarted = false;
+            }
             synchronized (syncIsLooping) {
                 isStreaming = false;
             }
-            try {
-                videoSenderThread.join();
-            } catch (InterruptedException e) {
-                LogTools.trace("RESCore", e);
-            }
-            synchronized (syncDstVideoEncoder) {
-                dstVideoEncoder.stop();
-                dstVideoEncoder.release();
-                dstVideoEncoder = null;
-                isEncoderStarted = false;
-            }
-            videoSenderThread = null;
+            videoEncoder = null;
             return true;
         }
     }
@@ -215,9 +193,8 @@ public class RESSoftVideoCore implements RESVideoCore {
     public void reSetVideoBitrate(int bitrate) {
         synchronized (syncOp) {
             if (videoEncoderFilterHandler != null) {
-                videoEncoderFilterHandler.sendMessage(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_RESET_BITRATE, bitrate, 0));
                 resCoreParameters.mediacdoecAVCBitRate = bitrate;
-                dstVideoFormat.setInteger(MediaFormat.KEY_BIT_RATE, resCoreParameters.mediacdoecAVCBitRate);
+                videoEncoderFilterHandler.sendMessage(videoEncoderFilterHandler.obtainMessage(VideoEncoderFilterHandler.WHAT_RESET_BITRATE, bitrate, 0));
             }
         }
     }
@@ -451,16 +428,8 @@ public class RESSoftVideoCore implements RESVideoCore {
                     drawFrameRateMeter.count();
                     //suitable4VideoEncoderBuff is ready
                     synchronized (syncDstVideoEncoder) {
-                        if (dstVideoEncoder != null && isEncoderStarted) {
-                            int eibIndex = dstVideoEncoder.dequeueInputBuffer(-1);
-                            if (eibIndex >= 0) {
-                                ByteBuffer dstVideoEncoderIBuffer = dstVideoEncoder.getInputBuffers()[eibIndex];
-                                dstVideoEncoderIBuffer.position(0);
-                                dstVideoEncoderIBuffer.put(suitable4VideoEncoderBuff.buff, 0, suitable4VideoEncoderBuff.buff.length);
-                                dstVideoEncoder.queueInputBuffer(eibIndex, 0, suitable4VideoEncoderBuff.buff.length, nowTimeMs * 1000, 0);
-                            } else {
-                                LogTools.d("dstVideoEncoder.dequeueInputBuffer(-1)<0");
-                            }
+                        if (videoEncoder != null) {
+                            videoEncoder.queueData(suitable4VideoEncoderBuff.buff, nowTimeMs);
                         }
                     }
 
@@ -468,10 +437,8 @@ public class RESSoftVideoCore implements RESVideoCore {
                 }
                 break;
                 case WHAT_RESET_BITRATE: {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && dstVideoEncoder != null) {
-                        Bundle bitrateBundle = new Bundle();
-                        bitrateBundle.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, msg.arg1);
-                        dstVideoEncoder.setParameters(bitrateBundle);
+                    if (videoEncoder != null) {
+                        videoEncoder.resetBitRate(msg.arg1);
                     }
                 }
                 break;
@@ -533,6 +500,7 @@ public class RESSoftVideoCore implements RESVideoCore {
                     return false;
                 }
             } catch (InterruptedException e) {
+                e.printStackTrace();
             }
             return false;
         }

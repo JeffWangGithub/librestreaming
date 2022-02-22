@@ -4,14 +4,12 @@ import android.annotation.TargetApi;
 import android.graphics.Bitmap;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
-import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.opengl.EGL14;
 import android.opengl.EGLExt;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.os.Build;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
@@ -29,6 +27,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import me.lake.librestreaming.client.CallbackDelivery;
 import me.lake.librestreaming.core.listener.RESScreenShotListener;
 import me.lake.librestreaming.core.listener.RESVideoChangeListener;
+import me.lake.librestreaming.encoder.VideoEncoder;
 import me.lake.librestreaming.filter.hardvideofilter.BaseHardVideoFilter;
 import me.lake.librestreaming.model.MediaCodecGLWapper;
 import me.lake.librestreaming.model.OffScreenGLWapper;
@@ -46,9 +45,9 @@ public class RESHardVideoCore implements RESVideoCore {
     RESCoreParameters resCoreParameters;
     private final Object syncOp = new Object();
     //filter
-    private Lock lockVideoFilter = null;
+    private Lock lockVideoFilter;
     private BaseHardVideoFilter videoFilter;
-    private MediaCodec dstVideoEncoder;
+//    private MediaCodec dstVideoEncoder;
     private MediaFormat dstVideoFormat;
     private final Object syncPreview = new Object();
     private HandlerThread videoGLHandlerThread;
@@ -303,10 +302,11 @@ public class RESHardVideoCore implements RESVideoCore {
         private RESFrameRateMeter drawFrameRateMeter;
         private int directionFlag;
         //sender
-        private VideoSenderThread videoSenderThread;
+        private VideoEncoder videoEncoder;
 
         boolean hasNewFrame = false;
         public boolean dropNextFrame = false;
+        private RESFlvDataCollecter dataCollecter;
 
         public VideoGLHandler(Looper looper) {
             super(looper);
@@ -398,39 +398,30 @@ public class RESHardVideoCore implements RESVideoCore {
                 }
                 break;
                 case WHAT_START_STREAMING: {
-                    if (dstVideoEncoder == null) {
-                        dstVideoEncoder = MediaCodecHelper.createHardVideoMediaCodec(resCoreParameters, dstVideoFormat);
-                        if (dstVideoEncoder == null) {
-                            throw new RuntimeException("create Video MediaCodec failed");
-                        }
-                    }
-                    dstVideoEncoder.configure(dstVideoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                    initMediaCodecGL(dstVideoEncoder.createInputSurface());
-                    dstVideoEncoder.start();
-                    videoSenderThread = new VideoSenderThread("VideoSenderThread", dstVideoEncoder, (RESFlvDataCollecter) msg.obj);
-                    videoSenderThread.start();
+                    dataCollecter = (RESFlvDataCollecter) msg.obj;
+                    videoEncoder = new VideoEncoder(resCoreParameters, dataCollecter);
+
+                    initMediaCodecGL(videoEncoder.getInputSurface());
+                    videoEncoder.start();
+
                 }
                 break;
                 case WHAT_STOP_STREAMING: {
-                    videoSenderThread.quit();
-                    try {
-                        videoSenderThread.join();
-                    } catch (InterruptedException e) {
-                        LogTools.trace("RESHardVideoCore,stopStreaming()failed", e);
-                    }
-                    videoSenderThread = null;
+                    videoEncoder.quit();
+                    videoEncoder = null;
                     uninitMediaCodecGL();
-                    dstVideoEncoder.stop();
-                    dstVideoEncoder.release();
-                    dstVideoEncoder = null;
+
                 }
                 break;
                 case WHAT_RESET_BITRATE: {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && mediaCodecGLWapper != null) {
-                        Bundle bitrateBundle = new Bundle();
-                        bitrateBundle.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, msg.arg1);
-                        dstVideoEncoder.setParameters(bitrateBundle);
+                    if (videoEncoder != null) {
+                        videoEncoder.resetBitRate(msg.arg1);
                     }
+//                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && mediaCodecGLWapper != null) {
+//                        Bundle bitrateBundle = new Bundle();
+//                        bitrateBundle.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, msg.arg1);
+//                        dstVideoEncoder.setParameters(bitrateBundle);
+//                    }
                 }
                 break;
                 case WHAT_RESET_VIDEO: {
@@ -442,16 +433,9 @@ public class RESHardVideoCore implements RESVideoCore {
                     resetFrameBuff();
                     if (mediaCodecGLWapper != null) {
                         uninitMediaCodecGL();
-                        dstVideoEncoder.stop();
-                        dstVideoEncoder.release();
-                        dstVideoEncoder = MediaCodecHelper.createHardVideoMediaCodec(resCoreParameters, dstVideoFormat);
-                        if (dstVideoEncoder == null) {
-                            throw new RuntimeException("create Video MediaCodec failed");
-                        }
-                        dstVideoEncoder.configure(dstVideoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                        initMediaCodecGL(dstVideoEncoder.createInputSurface());
-                        dstVideoEncoder.start();
-                        videoSenderThread.updateMediaCodec(dstVideoEncoder);
+                        videoEncoder = new VideoEncoder(resCoreParameters, dataCollecter);
+                        initMediaCodecGL(videoEncoder.getInputSurface());
+                        videoEncoder.start();
                     }
                     synchronized (syncResVideoChangeListener) {
                         if (resVideoChangeListener != null) {

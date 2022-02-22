@@ -1,10 +1,17 @@
-package me.lake.librestreaming.core;
+package me.lake.librestreaming.encoder;
 
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.view.Surface;
 
 import java.nio.ByteBuffer;
 
+import me.lake.librestreaming.core.MediaCodecHelper;
+import me.lake.librestreaming.model.RESCoreParameters;
 import me.lake.librestreaming.rtmp.RESFlvData;
 import me.lake.librestreaming.rtmp.RESFlvDataCollecter;
 import me.lake.librestreaming.rtmp.RESRtmpSender;
@@ -13,37 +20,82 @@ import me.lake.librestreaming.tools.LogTools;
 /**
  * 主要负责encode源数据，封装成RESFlvData
  */
-public class VideoSenderThread extends Thread {
+public class VideoEncoder {
     private static final long WAIT_TIME = 5000;
     private MediaCodec.BufferInfo eInfo;
     private long startTime;
     private MediaCodec dstVideoEncoder;
     private final Object syncDstVideoEncoder = new Object();
     private RESFlvDataCollecter dataCollecter;
+    private boolean shouldQuit = false;
+    private RESCoreParameters resCoreParameters;
+    private MediaFormat dstVideoFormat;
 
-    VideoSenderThread(String name, MediaCodec encoder, RESFlvDataCollecter flvDataCollecter) {
-        super(name);
+    public VideoEncoder(RESCoreParameters resCoreParameters, RESFlvDataCollecter flvDataCollecter) {
+        this.resCoreParameters = resCoreParameters;
         eInfo = new MediaCodec.BufferInfo();
         startTime = 0;
-        dstVideoEncoder = encoder;
         dataCollecter = flvDataCollecter;
+        dstVideoFormat = new MediaFormat();
+        dstVideoEncoder = MediaCodecHelper.createHardVideoMediaCodec(resCoreParameters, dstVideoFormat);
+        if (dstVideoEncoder == null) {
+            throw new RuntimeException("create Video MediaCodec failed");
+        }
+        dstVideoEncoder.configure(dstVideoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
     }
 
-    public void updateMediaCodec(MediaCodec encoder) {
-        synchronized (syncDstVideoEncoder) {
-            dstVideoEncoder = encoder;
+    public Surface getInputSurface() {
+        return dstVideoEncoder.createInputSurface();
+    }
+
+
+    public void resetBitRate(int bitrate) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            Bundle bitrateBundle = new Bundle();
+            bitrateBundle.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bitrate);
+            dstVideoEncoder.setParameters(bitrateBundle);
         }
     }
 
-    private boolean shouldQuit = false;
-
-    void quit() {
-        shouldQuit = true;
-        this.interrupt();
+    public void start() {
+        shouldQuit = false;
+        dstVideoEncoder.start();
+        run();
     }
 
-    @Override
-    public void run() {
+    public void quit() {
+        shouldQuit = true;
+    }
+
+    public void queueData(byte[] data, long timeMs) {
+        if (dstVideoEncoder != null && !shouldQuit) {
+            int eibIndex = dstVideoEncoder.dequeueInputBuffer(-1);
+            if (eibIndex >= 0) {
+                ByteBuffer dstVideoEncoderIBuffer = dstVideoEncoder.getInputBuffers()[eibIndex];
+                dstVideoEncoderIBuffer.position(0);
+                dstVideoEncoderIBuffer.put(data, 0, data.length);
+                dstVideoEncoder.queueInputBuffer(eibIndex, 0, data.length, timeMs * 1000, 0);
+            } else {
+                LogTools.d("dstVideoEncoder.dequeueInputBuffer(-1)<0");
+            }
+        }
+    }
+
+    private void run() {
+        HandlerThread videoEncodeThread = new HandlerThread("video encode thread");
+        videoEncodeThread.start();
+
+        Handler handler = new Handler(videoEncodeThread.getLooper());
+
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                encode();
+            }
+        });
+    }
+
+    private void encode() {
         while (!shouldQuit) {
             synchronized (syncDstVideoEncoder) {
                 int eobIndex = MediaCodec.INFO_TRY_AGAIN_LATER;
@@ -85,7 +137,15 @@ public class VideoSenderThread extends Thread {
                 }
             }
         }
+        release();
         eInfo = null;
+    }
+
+    private void release() {
+        shouldQuit = true;
+        dstVideoEncoder.stop();
+        dstVideoEncoder.release();
+        dstVideoEncoder = null;
     }
 
     private void sendAVCDecoderConfigurationRecord(long tms, MediaFormat format) {

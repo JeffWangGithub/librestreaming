@@ -28,7 +28,6 @@ public class AudioEncoder {
 
     public AudioEncoder(RESCoreParameters resCoreParameters, RESFlvDataCollecter flvDataCollecter) {
         startTime = System.currentTimeMillis();
-//        dstAudioEncoder = encoder;
         dataCollecter = flvDataCollecter;
         dstAudioFormat = new MediaFormat();
         dstAudioEncoder = MediaCodecHelper.createAudioMediaCodec(resCoreParameters, dstAudioFormat);
@@ -117,6 +116,7 @@ public class AudioEncoder {
         shouldQuit = true;
         dstAudioEncoder.stop();
         dstAudioEncoder.release();
+        dstAudioEncoder = null;
     }
 
     private void sendAudioSpecificConfig(long tms, byte[] data) {
