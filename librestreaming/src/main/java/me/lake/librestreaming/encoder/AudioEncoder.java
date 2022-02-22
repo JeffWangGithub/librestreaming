@@ -1,38 +1,83 @@
-package me.lake.librestreaming.core;
+package me.lake.librestreaming.encoder;
 
 import android.media.MediaCodec;
+import android.media.MediaFormat;
+import android.os.Handler;
+import android.os.HandlerThread;
 
 import java.nio.ByteBuffer;
 
+import me.lake.librestreaming.core.MediaCodecHelper;
+import me.lake.librestreaming.model.RESCoreParameters;
 import me.lake.librestreaming.rtmp.RESFlvData;
 import me.lake.librestreaming.rtmp.RESFlvDataCollecter;
 import me.lake.librestreaming.rtmp.RESRtmpSender;
+import me.lake.librestreaming.tools.LogTools;
 
 /**
  * Created by lakeinchina on 26/05/16.
  */
-public class AudioSenderThread extends Thread {
+public class AudioEncoder {
     private static final long WAIT_TIME = -1;//1ms;
     private long startTime;
     private MediaCodec dstAudioEncoder;
     private RESFlvDataCollecter dataCollecter;
-
-    AudioSenderThread(String name, MediaCodec encoder, RESFlvDataCollecter flvDataCollecter) {
-        super(name);
-        startTime = System.currentTimeMillis();
-        dstAudioEncoder = encoder;
-        dataCollecter = flvDataCollecter;
-    }
-
     private boolean shouldQuit = false;
+    private RESCoreParameters resCoreParameters;
+    private MediaFormat dstAudioFormat;
 
-    void quit() {
-        shouldQuit = true;
-        this.interrupt();
+    public AudioEncoder(RESCoreParameters resCoreParameters, RESFlvDataCollecter flvDataCollecter) {
+        startTime = System.currentTimeMillis();
+//        dstAudioEncoder = encoder;
+        dataCollecter = flvDataCollecter;
+        dstAudioFormat = new MediaFormat();
+        dstAudioEncoder = MediaCodecHelper.createAudioMediaCodec(resCoreParameters, dstAudioFormat);
+        if (dstAudioEncoder != null) {
+            dstAudioEncoder.configure(dstAudioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+        }
     }
 
-    @Override
-    public void run() {
+    public void start() {
+        shouldQuit = false;
+        dstAudioEncoder.start();
+        run();
+    }
+
+    public void quit() {
+        shouldQuit = true;
+    }
+
+    public void queueData(byte[] data, int length, long timeMs) {
+        //orignAudioBuff is ready
+        int eibIndex = dstAudioEncoder.dequeueInputBuffer(-1);
+        if (eibIndex >= 0) {
+            ByteBuffer inputBuffer = dstAudioEncoder.getInputBuffer(eibIndex);
+            if (inputBuffer != null) {
+                inputBuffer.clear();
+                int bufferRemaining = inputBuffer.remaining();
+                //剩余buffer大小
+                inputBuffer.put(data, 0, Math.min(bufferRemaining, length));
+                dstAudioEncoder.queueInputBuffer(eibIndex, 0, inputBuffer.position(), timeMs * 1000, 0);
+            }
+        } else {
+            LogTools.d("dstAudioEncoder.dequeueInputBuffer(-1)<0");
+        }
+    }
+
+    private void run() {
+        HandlerThread audioEncoderThread = new HandlerThread("Audio Encoder Thread");
+        audioEncoderThread.start();
+
+        Handler handler = new Handler(audioEncoderThread.getLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                encode();
+            }
+        });
+    }
+
+    private void encode() {
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         while (!shouldQuit) {
             int outputBufferIndex = dstAudioEncoder.dequeueOutputBuffer(bufferInfo, WAIT_TIME);
@@ -65,6 +110,13 @@ public class AudioSenderThread extends Thread {
                 break;
             }
         }
+        release();
+    }
+
+    private void release() {
+        shouldQuit = true;
+        dstAudioEncoder.stop();
+        dstAudioEncoder.release();
     }
 
     private void sendAudioSpecificConfig(long tms, byte[] data) {

@@ -1,18 +1,16 @@
 package me.lake.librestreaming.core;
 
-import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
-import android.media.MediaFormat;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.Message;
 
-import java.nio.ByteBuffer;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
+import me.lake.librestreaming.encoder.AudioEncoder;
 import me.lake.librestreaming.filter.softaudiofilter.BaseSoftAudioFilter;
 import me.lake.librestreaming.model.RESConfig;
 import me.lake.librestreaming.model.RESCoreParameters;
@@ -25,14 +23,13 @@ import me.lake.librestreaming.tools.LogTools;
 public class RESSoftAudioCore {
     RESCoreParameters resCoreParameters;
     private final Object syncOp = new Object();
-    private MediaCodec dstAudioEncoder;
-    private MediaFormat dstAudioFormat;
     //filter
     private Lock lockAudioFilter;
     private BaseSoftAudioFilter audioFilter;
     private AudioEncodeFilterHandler audioEncodeFilterHandler;
     private HandlerThread audioFilterHandlerThread;
-    private AudioSenderThread audioSenderThread;
+    private AudioEncoder audioEncoder;
+    private boolean isStarting = false;
 
     public RESSoftAudioCore(RESCoreParameters parameters) {
         resCoreParameters = parameters;
@@ -41,7 +38,9 @@ public class RESSoftAudioCore {
 
     public void queueAudio(byte[] rawAudioFrame, int size) {
         //TODO此处需要添加buffer的逻辑
-        audioEncodeFilterHandler.sendMessage(audioEncodeFilterHandler.obtainMessage(AudioEncodeFilterHandler.WHAT_INCOMING_BUFF, size, 0, rawAudioFrame));
+        if (isStarting) {
+            audioEncodeFilterHandler.sendMessage(audioEncodeFilterHandler.obtainMessage(AudioEncodeFilterHandler.WHAT_INCOMING_BUFF, size, 0, rawAudioFrame));
+        }
     }
 
     public boolean prepare(RESConfig resConfig) {
@@ -51,13 +50,6 @@ public class RESSoftAudioCore {
             resCoreParameters.mediacodecAACChannelCount = 1;
             resCoreParameters.mediacodecAACBitRate = 32 * 1024;
             resCoreParameters.mediacodecAACMaxInputSize = 8820;
-
-            dstAudioFormat = new MediaFormat();
-            dstAudioEncoder = MediaCodecHelper.createAudioMediaCodec(resCoreParameters, dstAudioFormat);
-            if (dstAudioEncoder == null) {
-                LogTools.e("create Audio MediaCodec failed");
-                return false;
-            }
             return true;
         }
     }
@@ -65,16 +57,15 @@ public class RESSoftAudioCore {
     public void start(RESFlvDataCollecter flvDataCollecter) {
         synchronized (syncOp) {
             try {
-                if (dstAudioEncoder == null) {
-                    dstAudioEncoder = MediaCodec.createEncoderByType(dstAudioFormat.getString(MediaFormat.KEY_MIME));
-                }
-                dstAudioEncoder.configure(dstAudioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                dstAudioEncoder.start();
+                //每次start重新创建
+                audioEncoder = new AudioEncoder(resCoreParameters, flvDataCollecter);
+                audioEncoder.start();
+
                 audioFilterHandlerThread = new HandlerThread("audioFilterHandlerThread");
                 audioFilterHandlerThread.start();
                 audioEncodeFilterHandler = new AudioEncodeFilterHandler(audioFilterHandlerThread.getLooper());
-                audioSenderThread = new AudioSenderThread("AudioSenderThread", dstAudioEncoder, flvDataCollecter);
-                audioSenderThread.start();
+
+                isStarting = true;
             } catch (Exception e) {
                 LogTools.trace("RESSoftAudioCore", e);
             }
@@ -83,18 +74,15 @@ public class RESSoftAudioCore {
 
     public void stop() {
         synchronized (syncOp) {
+            isStarting = false;
             audioEncodeFilterHandler.removeCallbacksAndMessages(null);
             audioFilterHandlerThread.quit();
             try {
                 audioFilterHandlerThread.join();
-                audioSenderThread.quit();
-                audioSenderThread.join();
+                audioEncoder.quit();
             } catch (InterruptedException e) {
                 LogTools.trace("RESSoftAudioCore", e);
             }
-            dstAudioEncoder.stop();
-            dstAudioEncoder.release();
-            dstAudioEncoder = null;
         }
     }
 
@@ -159,19 +147,7 @@ public class RESSoftAudioCore {
                 }
             }
             //orignAudioBuff is ready
-            int eibIndex = dstAudioEncoder.dequeueInputBuffer(-1);
-            if (eibIndex >= 0) {
-                ByteBuffer inputBuffer = dstAudioEncoder.getInputBuffer(eibIndex);
-                if (inputBuffer != null) {
-                    inputBuffer.clear();
-                    int bufferRemaining = inputBuffer.remaining();
-                    //剩余buffer大小
-                    inputBuffer.put(orginBufferData, 0, Math.min(bufferRemaining, length));
-                    dstAudioEncoder.queueInputBuffer(eibIndex, 0, inputBuffer.position(), nowTimeMs * 1000, 0);
-                }
-            } else {
-                LogTools.d("dstAudioEncoder.dequeueInputBuffer(-1)<0");
-            }
+            audioEncoder.queueData(orginBufferData, length, nowTimeMs);
             LogTools.d("AudioFilterHandler,ProcessTime:" + (System.currentTimeMillis() - nowTimeMs));
         }
 
